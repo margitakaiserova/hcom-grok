@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Prepare a generic HCOM workspace in one native Ghostty window.
+#
+# The launcher uses the directory and optional HCOM_DIR from the shell that
+# invokes it. It does not select a named room or project.
+#
+# Layout:
+# Every command is pretyped before any Return key is sent.
+#
+#   Tabs 1 to 4: submit hcom codex, hcom-grok, hcom agy, and hcom cursor
+#   Tab 6: submit all 8 hcom cursor commands
+#   Tab 7: submit all 8 hcom cursor commands
+#   Tab 5: submit all 16 hcom agy commands last
+#
+# Launch order is 1, 2, 3, 4, 6, 7, 5. The Cursor grids provide the normal
+# startup interval between the first Antigravity seat and the Tab 5 grid.
+set -euo pipefail
+
+readonly ghostty_app="/Applications/Ghostty.app"
+readonly workspace_cwd="$PWD"
+
+current_pane_helper="$(command -v hcom-exec-here || true)"
+readonly current_pane_helper
+
+fail() {
+  printf 'hcom-ghostty-workspace: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ -d "$ghostty_app" ]] || fail "Ghostty is missing: $ghostty_app"
+command -v hcom >/dev/null 2>&1 || fail "HCOM is missing from PATH"
+command -v hcom-grok >/dev/null 2>&1 || fail "hcom-grok is missing from PATH"
+[[ -n "$current_pane_helper" && -x "$current_pane_helper" ]] || fail "hcom-exec-here is missing from PATH"
+[[ -d "$workspace_cwd" ]] || fail "working directory is missing: $workspace_cwd"
+
+export HCOM_WORKSPACE_CWD="$workspace_cwd"
+export HCOM_WORKSPACE_HCOM_DIR="${HCOM_DIR:-}"
+export HCOM_WORKSPACE_CURRENT_PANE="$current_pane_helper {script}"
+export HCOM_WORKSPACE_CODEX_INPUT="hcom codex"
+export HCOM_WORKSPACE_GROK_INPUT="hcom-grok"
+export HCOM_WORKSPACE_AGY_INPUT="hcom agy"
+export HCOM_WORKSPACE_CURSOR_INPUT="hcom cursor"
+
+result="$({ osascript <<'APPLESCRIPT'
+on makeConfiguration(inputText, workspaceCwd, fontSizeValue, hcomDir, currentPaneHelper)
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set font size of cfg to fontSizeValue
+    set initial working directory of cfg to workspaceCwd
+
+    set launchEnvironment to {"HCOM_TERMINAL=" & currentPaneHelper}
+    if hcomDir is not "" then set end of launchEnvironment to "HCOM_DIR=" & hcomDir
+    set environment variables of cfg to launchEnvironment
+
+    if inputText is not "" then set initial input of cfg to inputText
+    return cfg
+  end tell
+end makeConfiguration
+
+on focusTab(targetTab, surfaceDelay)
+  tell application "Ghostty"
+    select tab targetTab
+    set targetTerminal to terminal 1 of targetTab
+    focus targetTerminal
+    delay surfaceDelay
+  end tell
+end focusTab
+
+on submitTerminal(targetTerminal, launchDelay)
+  tell application "Ghostty"
+    send key "enter" to targetTerminal
+    delay launchDelay
+  end tell
+end submitTerminal
+
+on moveTabToIndex(targetTab, desiredIndex, surfaceDelay)
+  tell application "Ghostty"
+    repeat 12 times
+      set currentIndex to index of targetTab
+      if currentIndex is desiredIndex then return
+
+      set targetTerminal to terminal 1 of targetTab
+      focus targetTerminal
+      if currentIndex > desiredIndex then
+        perform action "move_tab:-1" on targetTerminal
+      else
+        perform action "move_tab:1" on targetTerminal
+      end if
+      delay surfaceDelay
+    end repeat
+
+    error "Could not move Ghostty tab to index " & desiredIndex
+  end tell
+end moveTabToIndex
+
+on buildGrid(targetTab, inputText, workspaceCwd, columnCount, rowCount, fontSizeValue, hcomDir, currentPaneHelper, surfaceDelay)
+  tell application "Ghostty"
+    my focusTab(targetTab, surfaceDelay)
+    set firstTerminal to terminal 1 of targetTab
+    set topRow to {firstTerminal}
+
+    repeat with columnIndex from 2 to columnCount
+      set horizontalAnchor to item -1 of topRow
+      set cfg to my makeConfiguration(inputText, workspaceCwd, fontSizeValue, hcomDir, currentPaneHelper)
+      set newTerminal to split horizontalAnchor direction right with configuration cfg
+      set end of topRow to newTerminal
+      delay surfaceDelay
+    end repeat
+
+    repeat with columnTerminalReference in topRow
+      set verticalAnchor to contents of columnTerminalReference
+      repeat with rowIndex from 2 to rowCount
+        set cfg to my makeConfiguration(inputText, workspaceCwd, fontSizeValue, hcomDir, currentPaneHelper)
+        set newTerminal to split verticalAnchor direction down with configuration cfg
+        set verticalAnchor to newTerminal
+        delay surfaceDelay
+      end repeat
+    end repeat
+
+    perform action "equalize_splits" on firstTerminal
+    delay surfaceDelay
+    focus firstTerminal
+  end tell
+end buildGrid
+
+set workspaceCwd to system attribute "HCOM_WORKSPACE_CWD"
+set hcomDir to system attribute "HCOM_WORKSPACE_HCOM_DIR"
+set currentPaneHelper to system attribute "HCOM_WORKSPACE_CURRENT_PANE"
+set codexInput to system attribute "HCOM_WORKSPACE_CODEX_INPUT"
+set grokInput to system attribute "HCOM_WORKSPACE_GROK_INPUT"
+set agyInput to system attribute "HCOM_WORKSPACE_AGY_INPUT"
+set cursorInput to system attribute "HCOM_WORKSPACE_CURSOR_INPUT"
+
+set singleFontSize to 18
+set gridFontSize to 10
+set surfaceDelay to 0.35
+set launchDelay to 1.0
+
+tell application "Ghostty"
+  activate
+
+  set codexCfg to my makeConfiguration(codexInput, workspaceCwd, singleFontSize, hcomDir, currentPaneHelper)
+  set workspaceWindow to new window with configuration codexCfg
+  set codexTab to tab 1 of workspaceWindow
+  my focusTab(codexTab, surfaceDelay)
+
+  set grokCfg to my makeConfiguration(grokInput, workspaceCwd, singleFontSize, hcomDir, currentPaneHelper)
+  set grokTab to new tab in workspaceWindow with configuration grokCfg
+  my focusTab(grokTab, surfaceDelay)
+
+  set agyCfg to my makeConfiguration(agyInput, workspaceCwd, singleFontSize, hcomDir, currentPaneHelper)
+  set agyTab to new tab in workspaceWindow with configuration agyCfg
+  my focusTab(agyTab, surfaceDelay)
+
+  set cursorCfg to my makeConfiguration(cursorInput, workspaceCwd, singleFontSize, hcomDir, currentPaneHelper)
+  set cursorTab to new tab in workspaceWindow with configuration cursorCfg
+  my focusTab(cursorTab, surfaceDelay)
+
+  set agyGridCfg to my makeConfiguration(agyInput, workspaceCwd, gridFontSize, hcomDir, currentPaneHelper)
+  set agyGridTab to new tab in workspaceWindow with configuration agyGridCfg
+  my focusTab(agyGridTab, surfaceDelay)
+
+  set cursorGridCfgOne to my makeConfiguration(cursorInput, workspaceCwd, gridFontSize, hcomDir, currentPaneHelper)
+  set cursorGridTabOne to new tab in workspaceWindow with configuration cursorGridCfgOne
+  my focusTab(cursorGridTabOne, surfaceDelay)
+
+  set cursorGridCfgTwo to my makeConfiguration(cursorInput, workspaceCwd, gridFontSize, hcomDir, currentPaneHelper)
+  set cursorGridTabTwo to new tab in workspaceWindow with configuration cursorGridCfgTwo
+  my focusTab(cursorGridTabTwo, surfaceDelay)
+
+  my moveTabToIndex(codexTab, 1, surfaceDelay)
+  my moveTabToIndex(grokTab, 2, surfaceDelay)
+  my moveTabToIndex(agyTab, 3, surfaceDelay)
+  my moveTabToIndex(cursorTab, 4, surfaceDelay)
+  my moveTabToIndex(agyGridTab, 5, surfaceDelay)
+  my moveTabToIndex(cursorGridTabOne, 6, surfaceDelay)
+  my moveTabToIndex(cursorGridTabTwo, 7, surfaceDelay)
+
+  my buildGrid(agyGridTab, agyInput, workspaceCwd, 4, 4, gridFontSize, hcomDir, currentPaneHelper, surfaceDelay)
+  my buildGrid(cursorGridTabOne, cursorInput, workspaceCwd, 4, 2, gridFontSize, hcomDir, currentPaneHelper, surfaceDelay)
+  my buildGrid(cursorGridTabTwo, cursorInput, workspaceCwd, 4, 2, gridFontSize, hcomDir, currentPaneHelper, surfaceDelay)
+
+  my submitTerminal(terminal 1 of codexTab, launchDelay)
+  my submitTerminal(terminal 1 of grokTab, launchDelay)
+  my submitTerminal(terminal 1 of agyTab, launchDelay)
+  my submitTerminal(terminal 1 of cursorTab, launchDelay)
+
+  set cursorGridTerminalsOne to terminals of cursorGridTabOne
+  set cursorGridCountOne to count of cursorGridTerminalsOne
+  repeat with seatIndex from 1 to cursorGridCountOne
+    my submitTerminal(item seatIndex of cursorGridTerminalsOne, launchDelay)
+  end repeat
+
+  set cursorGridTerminalsTwo to terminals of cursorGridTabTwo
+  set cursorGridCountTwo to count of cursorGridTerminalsTwo
+  repeat with seatIndex from 1 to cursorGridCountTwo
+    my submitTerminal(item seatIndex of cursorGridTerminalsTwo, launchDelay)
+  end repeat
+
+  set agyGridTerminals to terminals of agyGridTab
+  set agyGridCount to count of agyGridTerminals
+  repeat with seatIndex from 1 to agyGridCount
+    my submitTerminal(item seatIndex of agyGridTerminals, launchDelay)
+  end repeat
+
+  select tab codexTab
+  set codexTerminal to focused terminal of codexTab
+  focus codexTerminal
+  activate window workspaceWindow
+
+  set launchSummary to "window_id=" & (id of workspaceWindow as text)
+  set launchSummary to launchSummary & " tabs=" & (count of tabs of workspaceWindow)
+  set launchSummary to launchSummary & " terminals=" & (count of terminals of workspaceWindow)
+  set launchSummary to launchSummary & " layout=1,1,1,1,16,8,8"
+  set launchSummary to launchSummary & " submitted=36"
+  set launchSummary to launchSummary & " grid_submitted=16,8,8"
+  set launchSummary to launchSummary & " pending=0"
+  set launchSummary to launchSummary & " launch_order=1,2,3,4,6,7,5"
+  return launchSummary
+end tell
+APPLESCRIPT
+} 2>&1)" || fail "$result"
+
+printf 'hcom-ghostty-workspace: %s\n' "$result"

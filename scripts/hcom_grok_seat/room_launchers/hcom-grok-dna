@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# hcom-grok-dna: start or operate a Grok seat in the DNA HCOM room.
+# Does not open a new Ghostty window.
+set -euo pipefail
+unset NO_COLOR
+export FORCE_COLOR=1
+export CLICOLOR=1
+export COLORTERM=truecolor
+PROJECT="/Users/maneeshpatel/Desktop/Atlas_DNA_Maths_Layers"
+export HCOM_DIR="/Users/maneeshpatel/.hcom-rooms/room-2"
+cd "$PROJECT"
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+exec "$HOME/.local/bin/hcom-grok" "$@"
