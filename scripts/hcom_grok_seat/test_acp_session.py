@@ -12,8 +12,11 @@ from typing import Any
 from .acp_session import (
     AcpCompatibilityError,
     AcpHandshake,
+    NewSessionFence,
     PermissionBroker,
     ResumeReplayFence,
+    create_session,
+    load_session,
     cancel_prompt,
     initialize_authenticated,
     resume_session,
@@ -128,6 +131,42 @@ def permission_params(tool_call_id: str = "tool-1") -> dict[str, Any]:
 
 
 class AcpSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_session_binds_buffered_updates_to_returned_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cwd = Path(td).resolve()
+            session_id = "11111111-1111-4111-8111-111111111111"
+            fake = FakeClient(session_result={"sessionId": session_id})
+            fence = NewSessionFence()
+            fake.notification_sink = fence
+            buffered = {
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "agent_message_chunk"},
+                },
+            }
+            await fence(buffered)
+            received: list[dict[str, Any]] = []
+
+            def make_sink(observed: str):
+                self.assertEqual(observed, session_id)
+
+                async def sink(notification: dict[str, Any]) -> None:
+                    received.append(notification)
+
+                return sink
+
+            actual, _ = await create_session(
+                fake,  # type: ignore[arg-type]
+                cwd,
+                notification_fence=fence,
+                live_sink_factory=make_sink,
+            )
+            self.assertEqual(actual, session_id)
+            self.assertEqual(received, [buffered])
+            self.assertEqual(fake.flush_count, 1)
+            self.assertEqual(fake.calls[-1][0], "session/new")
+
     async def test_initialize_resume_validates_and_flushes_before_sealing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cwd = Path(td).resolve()
@@ -188,6 +227,30 @@ class AcpSessionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(mode, "load")
             self.assertEqual(fake.calls[-1][0], "session/load")
+
+    async def test_explicit_load_uses_fresh_sidecar_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cwd = Path(td).resolve()
+            handshake = AcpHandshake(
+                1,
+                "1.0.13",
+                "cached_token",
+                {"loadSession": True, "sessionCapabilities": {"resume": {}}},
+                None,
+            )
+            fake = FakeClient(session_result=valid_resume_result(cwd))
+            fence = ResumeReplayFence("session-1", "load")
+            fake.notification_sink = fence
+            result = await load_session(
+                fake,  # type: ignore[arg-type]
+                handshake,
+                "session-1",
+                cwd,
+                replay_fence=fence,
+            )
+            self.assertEqual(result["_meta"]["sessionId"], "session-1")
+            self.assertEqual(fake.calls[-1][0], "session/load")
+            self.assertTrue(fence.sealed)
 
     async def test_resume_result_identity_cwd_and_model_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -304,6 +367,34 @@ class AcpSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(fence.live_sink, live_sink)
         self.assertEqual(forwarded, [live, unrelated])
 
+    async def test_load_fence_passthrough_does_not_retain_future_live_events(self) -> None:
+        forwarded: list[dict[str, Any]] = []
+
+        async def live_sink(notification: dict[str, Any]) -> None:
+            forwarded.append(notification)
+
+        fence = ResumeReplayFence(
+            "session-1", "load", live_sink=live_sink, max_live_events=1
+        )
+        before = session_update(
+            "event-1",
+            "prompt-1",
+            "agent_message_chunk",
+            content={"type": "text", "text": "before"},
+        )
+        after = session_update(
+            "event-2",
+            "prompt-2",
+            "agent_message_chunk",
+            content={"type": "text", "text": "after"},
+        )
+        await fence(before)
+        await fence.seal()
+        self.assertEqual(await fence.activate_passthrough(), (before,))
+        await fence(after)
+        self.assertEqual(await fence.drain_live(), ())
+        self.assertEqual(forwarded, [before, after])
+
     async def test_resume_fence_rejects_replay(self) -> None:
         fence = ResumeReplayFence("session-1", "resume")
         with self.assertRaises(AcpCompatibilityError):
@@ -339,6 +430,18 @@ class AcpSessionTests(unittest.IsolatedAsyncioTestCase):
         tiny = ResumeReplayFence("session-1", "load", max_live_bytes=1)
         with self.assertRaisesRegex(AcpCompatibilityError, "byte limit"):
             await tiny(first)
+
+        replay_tiny = ResumeReplayFence("session-1", "load", max_live_bytes=1)
+        replay = session_update(
+            "event-replay",
+            "prompt-1",
+            "hook_execution",
+            replay=True,
+            event_name="user_prompt_submit",
+            prompt_id="prompt-1",
+        )
+        with self.assertRaisesRegex(AcpCompatibilityError, "replay.*byte limit"):
+            await replay_tiny(replay)
 
         non_finite = session_update(
             "event-3",

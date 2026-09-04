@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -65,6 +66,7 @@ class Config:
     bin_root: Path
     hcom_db: Path
     cursor_path: Path
+    grok_home: Path
     project: Path
     seat: str
     grok_bin: str
@@ -124,6 +126,7 @@ def load_config(*, fresh_project: bool = False) -> Config:
             _path_env("HCOM_DIR", home / ".hcom") / "hcom.db",
         ),
         cursor_path=_path_env("HCOM_GROK_CURSOR", state_root / "cursor.json"),
+        grok_home=_path_env("GROK_HOME", home / ".grok"),
         project=_path_env("HCOM_GROK_PROJECT", Path(project_default)),
         seat=os.environ.get("HCOM_GROK_SEAT", seat_default),
         grok_bin=os.environ.get("GROK_BIN", "grok"),
@@ -170,6 +173,7 @@ def managed_config(
         bin_root=_path_env("HCOM_GROK_BIN_ROOT", home / ".local/bin"),
         hcom_db=registry.hcom_db,
         cursor_path=state_root / "cursor.json",
+        grok_home=_path_env("GROK_HOME", home / ".grok"),
         project=Path(project_default).expanduser().resolve(),
         seat=normalize_seat(str(record["name"])),
         grok_bin=os.environ.get("GROK_BIN", "grok"),
@@ -227,8 +231,30 @@ def release_hcom_seat(hcom_db: Path, hcom_bin: str, seat: str) -> None:
 
 
 def _private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
+    created = False
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=False)
+            created = True
+        except FileExistsError:
+            pass
+    if created:
+        os.chmod(path, 0o700)
+    try:
+        details = path.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"private directory is unavailable: {path}") from exc
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or stat.S_ISLNK(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise RuntimeError(
+            f"private directory must be real, user-owned, and mode 0700: {path}"
+        )
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -267,6 +293,49 @@ def validate_run_state(state: dict[str, Any] | None) -> list[str]:
     ):
         if key in state and not isinstance(state[key], str):
             problems.append(f"{key} is not a string")
+    for key in ("bound_session_id", "bridge_state", "grok_home"):
+        if key in state and not isinstance(state[key], str):
+            problems.append(f"{key} is not a string")
+    for key in (
+        "visible_session_id",
+        "degraded_reason",
+        "orphan_report",
+        "focus_source",
+        "status_trigger",
+        "registry_session_id",
+        "registry_observation_reason",
+        "pager_bootstrap_retained",
+    ):
+        if key in state and state[key] is not None and not isinstance(state[key], str):
+            problems.append(f"{key} is not a string or null")
+    if "status_sample_monotonic_ns" in state and not (
+        state["status_sample_monotonic_ns"] is None
+        or type(state["status_sample_monotonic_ns"]) is int
+        and state["status_sample_monotonic_ns"] > 0
+    ):
+        problems.append("status_sample_monotonic_ns is not a positive integer or null")
+    if "focus_state_monotonic_ns" in state and not (
+        state["focus_state_monotonic_ns"] is None
+        or type(state["focus_state_monotonic_ns"]) is int
+        and state["focus_state_monotonic_ns"] > 0
+    ):
+        problems.append("focus_state_monotonic_ns is not a positive integer or null")
+    if "pager_status_enabled" in state and type(state["pager_status_enabled"]) is not bool:
+        problems.append("pager_status_enabled is not a boolean")
+    for key in ("pager_status_reason", "pager_status_path"):
+        if key in state and not isinstance(state[key], str):
+            problems.append(f"{key} is not a string")
+    if "binding_generation" in state and (
+        type(state["binding_generation"]) is not int
+        or state["binding_generation"] < 0
+    ):
+        problems.append("binding_generation is not a non-negative integer")
+    if "session_alignment" in state and state["session_alignment"] not in {
+        "aligned",
+        "divergent",
+        "unknown",
+    }:
+        problems.append("session_alignment is invalid")
     if "launch_mode" in state and state["launch_mode"] not in {"new", "resumed"}:
         problems.append("launch_mode is not new or resumed")
     for key in ("background_tui", "ready", "busy"):
@@ -379,9 +448,13 @@ def supervisor_command(config: Config, marker: str, background_tui: bool) -> lis
     return command
 
 
-def _grok_session_directory(project: Path, session_id: str) -> Path:
+def _grok_session_directory(
+    grok_home: Path,
+    project: Path,
+    session_id: str,
+) -> Path:
     encoded = quote(str(project), safe="")
-    return Path.home() / ".grok" / "sessions" / encoded / session_id
+    return grok_home / "sessions" / encoded / session_id
 
 
 def require_resumable_session(config: Config) -> dict[str, Any]:
@@ -403,7 +476,7 @@ def require_resumable_session(config: Config) -> dict[str, Any]:
         )
     if not saved_project.is_dir():
         raise RuntimeError(f"Saved Grok project no longer exists: {saved_project}")
-    session_dir = _grok_session_directory(saved_project, session_id)
+    session_dir = _grok_session_directory(config.grok_home, saved_project, session_id)
     if not session_dir.is_dir():
         raise RuntimeError(
             f"Saved Grok session is no longer available: {session_id}. "
@@ -468,6 +541,7 @@ def start(
             "HCOM_GROK_SESSION_MODE": session_mode,
             "HCOM_GROK_SEAT": config.seat,
             "HCOM_DIR": str(config.hcom_db.parent),
+            "GROK_HOME": str(config.grok_home),
             "GROK_BIN": config.grok_bin,
             "HCOM_BIN": config.hcom_bin,
         }
@@ -532,6 +606,21 @@ def status(config: Config) -> dict[str, Any]:
         "ownership": ownership,
         **state,
     }
+    result.setdefault("bound_session_id", state.get("session_id"))
+    result.setdefault("visible_session_id", None)
+    result.setdefault("session_alignment", "unknown")
+    result.setdefault("binding_generation", 0)
+    result.setdefault("bridge_state", "LEGACY")
+    result.setdefault("degraded_reason", None)
+    result.setdefault("focus_source", None)
+    result.setdefault("status_trigger", None)
+    result.setdefault("status_sample_monotonic_ns", None)
+    result.setdefault("focus_state_monotonic_ns", None)
+    result.setdefault("pager_status_enabled", False)
+    result.setdefault("pager_status_reason", "legacy run state has no pager focus probe")
+    result.setdefault("registry_session_id", None)
+    result.setdefault("registry_observation_reason", None)
+    result.setdefault("pager_bootstrap_retained", None)
     return result
 
 
@@ -716,7 +805,52 @@ def doctor(config: Config) -> dict[str, Any]:
             add(label, False, str(exc))
     current = config.release_root / "current"
     add("installed_release", current.is_symlink() and current.exists(), str(current))
-    return {"ok": all(check["ok"] for check in checks), "checks": checks, "status": status(config)}
+    runtime_status = status(config)
+    known_divergent = runtime_status.get("running") is True and (
+        runtime_status.get("session_alignment") == "divergent"
+        or runtime_status.get("bridge_state") == "DEGRADED"
+    )
+    add(
+        "session_alignment",
+        not known_divergent,
+        (
+            str(runtime_status.get("degraded_reason") or "running seat is divergent")
+            if known_divergent
+            else str(runtime_status.get("session_alignment", "not running"))
+        ),
+    )
+    run_home = runtime_status.get("grok_home")
+    home_matches = run_home is None or str(config.grok_home) == run_home
+    add(
+        "grok_home_alignment",
+        home_matches,
+        f"configured={config.grok_home} running={run_home or '-'}",
+    )
+    pager_required = runtime_status.get("running") is True
+    pager_healthy = not pager_required or (
+        runtime_status.get("pager_status_enabled") is True
+        and runtime_status.get("focus_source") == "pager-status"
+        and runtime_status.get("status_sample_monotonic_ns") is not None
+    )
+    add(
+        "pager_focus_probe",
+        pager_healthy,
+        (
+            f"source={runtime_status.get('focus_source') or '-'} "
+            f"trigger={runtime_status.get('status_trigger') or '-'}"
+            if pager_healthy
+            else str(
+                runtime_status.get("pager_status_reason")
+                or runtime_status.get("degraded_reason")
+                or "running seat has no validated pager focus sample"
+            )
+        ),
+    )
+    return {
+        "ok": all(check["ok"] for check in checks),
+        "checks": checks,
+        "status": runtime_status,
+    }
 
 
 def inspect(config: Config) -> dict[str, Any]:
@@ -757,9 +891,15 @@ def _print_result(value: dict[str, Any], json_output: bool) -> None:
         mode = str(value.get("launch_mode", "unknown")).upper()
         print(
             f"{lifecycle}: mode={mode} seat={value.get('seat')} "
-            f"pid={value.get('supervisor_pid')} session={value.get('session_id')} "
+            f"pid={value.get('supervisor_pid')} "
+            f"session={value.get('bound_session_id', value.get('session_id'))} "
+            f"visible={value.get('visible_session_id') or '-'} "
+            f"alignment={value.get('session_alignment', 'unknown')} "
+            f"focus={value.get('focus_source') or '-'} "
             f"project={value.get('project')}"
         )
+        if value.get("degraded_reason"):
+            print(f"  blocked: {value['degraded_reason']}")
         return
     if value.get("running") is False:
         print("stopped")

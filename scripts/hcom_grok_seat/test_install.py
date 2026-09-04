@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +26,31 @@ class InstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = Path(__file__).resolve().parent
-            install.install_release(package, root / "releases", root / "bin", "integration-v1")
+            installed = install.install_release(
+                package, root / "releases", root / "bin", "integration-v1"
+            )
+            release = Path(installed["release"])
+            manifest = json.loads((release / "manifest.json").read_text())
+            self.assertIn("visible_session.py", manifest["files"])
+            self.assertIn("pager_status.py", manifest["files"])
+            imported = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from scripts.hcom_grok_seat import pager_status, supervisor, visible_session; "
+                    "assert supervisor.observe_visible_session is "
+                    "visible_session.observe_visible_session; "
+                    "assert supervisor.observe_pager_session is "
+                    "visible_session.observe_pager_session; "
+                    "assert pager_status.PAGER_RECORD_SCHEMA == 1",
+                ],
+                cwd=root,
+                env={**os.environ, "PYTHONPATH": str(release)},
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stderr)
             env = os.environ.copy()
             env.update(
                 {

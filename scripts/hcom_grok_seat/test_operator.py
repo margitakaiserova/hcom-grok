@@ -23,6 +23,7 @@ def _config(root: Path) -> operator.Config:
         bin_root=root / "bin",
         hcom_db=root / "hcom.db",
         cursor_path=state / "cursor.json",
+        grok_home=root / "grok-home",
         project=root / "project",
         seat="gsea",
         grok_bin="grok-test",
@@ -79,6 +80,7 @@ class OperatorTests(unittest.TestCase):
                 "HCOM_GROK_BIN_ROOT": str(root / "b"),
                 "HCOM_GROK_HCOM_DB": str(root / "db"),
                 "HCOM_GROK_CURSOR": str(root / "c"),
+                "GROK_HOME": str(root / "grok-home"),
                 "HCOM_GROK_PROJECT": str(root / "p"),
                 "HCOM_GROK_SEAT": "seat-test",
             }
@@ -90,6 +92,7 @@ class OperatorTests(unittest.TestCase):
             self.assertEqual(config.bin_root, (root / "b").resolve())
             self.assertEqual(config.hcom_db, (root / "db").resolve())
             self.assertEqual(config.cursor_path, (root / "c").resolve())
+            self.assertEqual(config.grok_home, (root / "grok-home").resolve())
             self.assertEqual(config.project, (root / "p").resolve())
             self.assertEqual(config.seat, "seat-test")
 
@@ -112,6 +115,20 @@ class OperatorTests(unittest.TestCase):
                 config = operator.load_config()
             self.assertEqual(config.project, project.resolve())
             self.assertEqual(config.seat, "saved-seat")
+
+    def test_grok_home_defaults_to_home_dot_grok(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root / "home"),
+                    "HCOM_GROK_STATE_ROOT": str(root / "state"),
+                },
+                clear=True,
+            ):
+                config = operator.load_config()
+            self.assertEqual(config.grok_home, (root / "home" / ".grok").resolve())
 
     def test_supervisor_command_exposes_full_runtime_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -141,6 +158,7 @@ class OperatorTests(unittest.TestCase):
             package_root = str(Path(operator.__file__).resolve().parents[2])
             self.assertEqual(captured["PYTHONPATH"].split(os.pathsep)[0], package_root)
             self.assertEqual(captured["HCOM_GROK_SESSION_MODE"], "new")
+            self.assertEqual(captured["GROK_HOME"], str(config.grok_home))
 
     def test_fresh_config_uses_current_project_instead_of_saved_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -185,12 +203,43 @@ class OperatorTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "no longer available"):
                     operator.require_resumable_session(config)
 
+    def test_resume_uses_configured_grok_home_instead_of_path_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configured_home = root / "configured-grok-home"
+            decoy_home = root / "decoy-home"
+            project = root / "project"
+            state = root / "state"
+            session_id = "session-in-configured-home"
+            project.mkdir()
+            state.mkdir()
+            (state / "session.json").write_text(
+                json.dumps({"project": str(project), "session_id": session_id})
+            )
+            session_dir = operator._grok_session_directory(
+                configured_home.resolve(), project.resolve(), session_id
+            )
+            session_dir.mkdir(parents=True)
+            env = {
+                "HOME": str(decoy_home),
+                "GROK_HOME": str(configured_home),
+                "HCOM_GROK_STATE_ROOT": str(state),
+                "HCOM_GROK_PROJECT": str(project),
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                config = operator.load_config()
+                saved = operator.require_resumable_session(config)
+            self.assertEqual(config.grok_home, configured_home.resolve())
+            self.assertNotEqual(config.grok_home, (decoy_home / ".grok").resolve())
+            self.assertEqual(saved["session_id"], session_id)
+
     def test_start_refuses_live_pid_with_incomplete_run_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = _config(root)
             config.project.mkdir()
             config.current_state.mkdir(parents=True)
+            os.chmod(config.current_state, 0o700)
             config.run_path.write_text(json.dumps({"supervisor_pid": 4321}))
             with mock.patch.object(operator, "pid_alive", return_value=True), mock.patch.object(
                 operator.subprocess, "run"
@@ -205,6 +254,7 @@ class OperatorTests(unittest.TestCase):
             config = _config(root)
             config.project.mkdir()
             config.current_state.mkdir(parents=True)
+            os.chmod(config.current_state, 0o700)
             config.run_path.write_text(json.dumps(_run_state(root)))
             with mock.patch.object(operator, "pid_alive", return_value=True), mock.patch.object(
                 operator, "verify_process_owner", return_value=(True, "ok")
@@ -219,6 +269,7 @@ class OperatorTests(unittest.TestCase):
             config = _config(root)
             config.project.mkdir()
             config.current_state.mkdir(parents=True)
+            os.chmod(config.current_state, 0o700)
             state = _run_state(root)
             state["launch_mode"] = "resumed"
             state["busy"] = False
@@ -239,6 +290,83 @@ class OperatorTests(unittest.TestCase):
             state["tui_pid"] = None
             state["starting"] = True
             self.assertEqual(operator.validate_run_state(state), [])
+
+    def test_status_exposes_binding_alignment_for_new_and_legacy_run_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root)
+            config.current_state.mkdir(parents=True)
+            state = _run_state(root)
+            config.run_path.write_text(json.dumps(state))
+            with mock.patch.object(operator, "pid_alive", return_value=True), mock.patch.object(
+                operator, "verify_process_owner", return_value=(True, "ok")
+            ):
+                legacy = operator.status(config)
+            self.assertEqual(legacy["bound_session_id"], "session-test")
+            self.assertIsNone(legacy["visible_session_id"])
+            self.assertEqual(legacy["session_alignment"], "unknown")
+            self.assertEqual(legacy["binding_generation"], 0)
+            self.assertFalse(legacy["pager_status_enabled"])
+            self.assertIsNone(legacy["focus_source"])
+
+            state.update(
+                {
+                    "bound_session_id": "session-new",
+                    "visible_session_id": "session-visible",
+                    "session_alignment": "divergent",
+                    "binding_generation": 4,
+                    "bridge_state": "DEGRADED",
+                    "degraded_reason": "visible mismatch",
+                    "grok_home": str(config.grok_home),
+                    "focus_source": "pager-status",
+                    "status_trigger": "state",
+                    "status_sample_monotonic_ns": 123,
+                    "pager_status_enabled": True,
+                    "pager_status_reason": "configured",
+                    "pager_status_path": str(root / "pager-status.json"),
+                    "registry_session_id": "session-stale",
+                    "registry_observation_reason": "diagnostic only",
+                }
+            )
+            config.run_path.write_text(json.dumps(state))
+            with mock.patch.object(operator, "pid_alive", return_value=True), mock.patch.object(
+                operator, "verify_process_owner", return_value=(True, "ok")
+            ):
+                current = operator.status(config)
+            self.assertEqual(current["bound_session_id"], "session-new")
+            self.assertEqual(current["binding_generation"], 4)
+            self.assertEqual(current["degraded_reason"], "visible mismatch")
+            self.assertEqual(current["focus_source"], "pager-status")
+            self.assertEqual(current["registry_session_id"], "session-stale")
+
+    def test_doctor_fails_a_known_running_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root)
+            config.project.mkdir()
+            config.state_root.mkdir(parents=True)
+            config.log_root.mkdir()
+            config.release_root.mkdir()
+            release = config.release_root / "release"
+            release.mkdir()
+            (config.release_root / "current").symlink_to(release)
+            runtime = {
+                "running": True,
+                "session_alignment": "divergent",
+                "bridge_state": "DEGRADED",
+                "degraded_reason": "visible mismatch",
+                "grok_home": str(config.grok_home),
+            }
+            with mock.patch.object(operator.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                operator, "_db_summary", return_value={"exists": True}
+            ), mock.patch.object(operator, "status", return_value=runtime):
+                result = operator.doctor(config)
+            alignment = next(
+                check for check in result["checks"] if check["name"] == "session_alignment"
+            )
+            self.assertFalse(result["ok"])
+            self.assertFalse(alignment["ok"])
+            self.assertIn("visible mismatch", alignment["detail"])
 
     def test_status_refuses_to_call_unmarked_pid_running(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

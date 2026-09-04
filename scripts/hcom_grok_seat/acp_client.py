@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import os
+import signal
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -119,6 +120,7 @@ class AsyncAcpClient:
         max_frame_bytes: int,
         notification_capacity: int,
         max_reverse_tasks: int,
+        process_group_owned: bool,
     ) -> None:
         self.proc = proc
         self.log_path = log_path
@@ -128,6 +130,7 @@ class AsyncAcpClient:
         self._notification_sink = notification_sink
         self._max_frame_bytes = max_frame_bytes
         self._max_reverse_tasks = max_reverse_tasks
+        self._process_group_owned = process_group_owned
         self._next_id = 0
         self._pending: dict[JsonId, _PendingRpc] = {}
         self._tombstones: set[JsonId] = set()
@@ -162,6 +165,7 @@ class AsyncAcpClient:
         max_frame_bytes: int = 16 * 1024 * 1024,
         notification_capacity: int = 4096,
         max_reverse_tasks: int = 32,
+        start_new_session: bool = False,
     ) -> "AsyncAcpClient":
         if not argv:
             raise ValueError("ACP argv cannot be empty")
@@ -198,6 +202,7 @@ class AsyncAcpClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=stderr_file,
                 limit=max_frame_bytes + 1,
+                start_new_session=start_new_session,
             )
         except BaseException:
             if log_file is not None:
@@ -215,6 +220,7 @@ class AsyncAcpClient:
             max_frame_bytes=max_frame_bytes,
             notification_capacity=notification_capacity,
             max_reverse_tasks=max_reverse_tasks,
+            process_group_owned=start_new_session,
         )
 
     @property
@@ -296,6 +302,16 @@ class AsyncAcpClient:
         timeout: float | None,
     ) -> Any:
         handle = await self.begin_request(method, params)
+        return await self.await_response(handle, timeout=timeout)
+
+    async def await_response(
+        self,
+        handle: RpcHandle,
+        *,
+        timeout: float | None,
+    ) -> Any:
+        """Finish a request whose frame has already drained to the child."""
+
         try:
             if timeout is None:
                 return await handle.response
@@ -304,7 +320,9 @@ class AsyncAcpClient:
         except TimeoutError as exc:
             self._pending.pop(handle.request_id, None)
             self._tombstones.add(handle.request_id)
-            error = AcpTransportClosed(f"timeout waiting for ACP method {method}")
+            error = AcpTransportClosed(
+                f"timeout waiting for ACP method {handle.method}"
+            )
             if not handle.response.done():
                 handle.response.set_exception(error)
                 with contextlib.suppress(AcpError):
@@ -578,17 +596,31 @@ class AsyncAcpClient:
             stdout_transport = getattr(self.proc.stdout, "_transport", None)
         if stdout_transport is not None and not stdout_transport.is_closing():
             stdout_transport.close()
-        if self.proc.returncode is None:
+        if self._process_group_owned:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGTERM)
+        elif self.proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 self.proc.terminate()
+        if self.proc.returncode is None:
             try:
                 await asyncio.wait_for(self.proc.wait(), timeout=2)
             except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
-                    self.proc.kill()
+                    if self._process_group_owned:
+                        os.killpg(self.proc.pid, signal.SIGKILL)
+                    else:
+                        self.proc.kill()
                 await self.proc.wait()
         else:
             await self.proc.wait()
+        if self._process_group_owned:
+            # The stdio parent can exit before a helper it spawned. A group
+            # created by this client remains ours until its last member exits.
+            # Signal immediately after reap rather than widening the PGID-reuse
+            # window with an arbitrary delay.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.proc.pid, signal.SIGKILL)
 
         # asyncio exposes no public close method for a Process or its stdout
         # StreamReader. Closing the owning transport is required when our sole

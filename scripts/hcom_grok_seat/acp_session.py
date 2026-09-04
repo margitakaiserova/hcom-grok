@@ -5,6 +5,7 @@ import asyncio
 import copy
 import inspect
 import json
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,7 +176,9 @@ class ResumeReplayFence:
         self._live_bytes = 0
         self._replay_event_ids: list[str] = []
         self._replay_count = 0
+        self._replay_bytes = 0
         self._sealed = False
+        self._passthrough = False
         self._lock = asyncio.Lock()
 
     @property
@@ -236,19 +239,25 @@ class ResumeReplayFence:
                         "ACP replay arrived on a resume or after replay fencing closed"
                     )
                 self._replay_count += 1
+                self._replay_bytes += notification_bytes
                 if self._replay_count > self._max_live_events:
                     raise AcpCompatibilityError("ACP replay exceeds the bounded event limit")
+                if self._replay_bytes > self._max_live_bytes:
+                    raise AcpCompatibilityError("ACP replay exceeds the bounded byte limit")
                 meta = params.get("_meta")
                 event_id = meta.get("eventId") if isinstance(meta, dict) else None
                 if isinstance(event_id, str) and event_id:
                     self._replay_event_ids.append(event_id)
                 return
-            if len(self._live) >= self._max_live_events:
-                raise AcpCompatibilityError("ACP live recovery buffer is full")
-            if self._live_bytes + notification_bytes > self._max_live_bytes:
-                raise AcpCompatibilityError("ACP live recovery buffer exceeds its byte limit")
-            self._live.append(copy.deepcopy(notification))
-            self._live_bytes += notification_bytes
+            if not self._passthrough:
+                if len(self._live) >= self._max_live_events:
+                    raise AcpCompatibilityError("ACP live recovery buffer is full")
+                if self._live_bytes + notification_bytes > self._max_live_bytes:
+                    raise AcpCompatibilityError(
+                        "ACP live recovery buffer exceeds its byte limit"
+                    )
+                self._live.append(copy.deepcopy(notification))
+                self._live_bytes += notification_bytes
         await self._forward_live(notification)
 
     async def seal(self) -> None:
@@ -262,6 +271,25 @@ class ResumeReplayFence:
             result = tuple(self._live)
             self._live.clear()
             self._live_bytes = 0
+            return result
+
+    async def activate_passthrough(self) -> tuple[JsonObject, ...]:
+        """Finish bounded recovery and forward later live events without buffering.
+
+        Notifications returned here were already forwarded to ``live_sink`` when
+        received. Returning them gives callers an auditable recovery cut while
+        atomically preventing an unbounded permanent sidecar buffer.
+        """
+
+        async with self._lock:
+            if not self._sealed:
+                raise AcpCompatibilityError(
+                    "cannot activate passthrough before replay fence sealing"
+                )
+            result = tuple(self._live)
+            self._live.clear()
+            self._live_bytes = 0
+            self._passthrough = True
             return result
 
     async def reconcile_prompt(
@@ -287,6 +315,109 @@ class ResumeReplayFence:
         )
 
 
+class NewSessionFence:
+    """Hold ACP updates until ``session/new`` proves their session identity.
+
+    A freshly-created ACP session has no ID when its stdio transport must be
+    spawned.  Dropping that window would make the creator sidecar unsuitable
+    as the delivery binding; accepting it unchecked would let a mismatched
+    update establish state.  This small fence does neither.
+    """
+
+    def __init__(self, *, max_events: int = DEFAULT_MAX_BUFFERED_LIVE_EVENTS,
+                 max_bytes: int = DEFAULT_MAX_BUFFERED_LIVE_BYTES) -> None:
+        if type(max_events) is not int or max_events < 1:
+            raise ValueError("max_events must be a positive integer")
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        self._max_events = max_events
+        self._max_bytes = max_bytes
+        self._pending: list[JsonObject] = []
+        self._pending_bytes = 0
+        self._session_id: str | None = None
+        self._sink: Callable[[JsonObject], Awaitable[None] | None] | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    def _session_update_id(self, notification: JsonObject) -> str | None:
+        if notification.get("method") not in _SESSION_UPDATE_METHODS:
+            return None
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            raise AcpCompatibilityError("ACP session update omitted params")
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            raise AcpCompatibilityError("ACP session update omitted session identity")
+        return session_id
+
+    @staticmethod
+    def _encoded_size(notification: JsonObject) -> int:
+        try:
+            return len(
+                json.dumps(
+                    notification,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8", "strict")
+            )
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise AcpCompatibilityError("ACP notification is not exact finite JSON") from exc
+
+    async def _forward(self, notification: JsonObject) -> None:
+        if self._sink is None:
+            return
+        result = self._sink(notification)
+        if inspect.isawaitable(result):
+            await result
+
+    async def __call__(self, notification: JsonObject) -> None:
+        if not isinstance(notification, dict):
+            raise AcpCompatibilityError("ACP notification is not an object")
+        async with self._lock:
+            observed = self._session_update_id(notification)
+            if self._session_id is None:
+                size = self._encoded_size(notification)
+                if len(self._pending) >= self._max_events:
+                    raise AcpCompatibilityError("ACP new-session buffer exceeds event limit")
+                if self._pending_bytes + size > self._max_bytes:
+                    raise AcpCompatibilityError("ACP new-session buffer exceeds byte limit")
+                self._pending.append(copy.deepcopy(notification))
+                self._pending_bytes += size
+                return
+            if observed is not None and observed != self._session_id:
+                raise AcpCompatibilityError("ACP new-session update has a mismatched session")
+            await self._forward(notification)
+
+    async def bind(
+        self,
+        session_id: str,
+        sink: Callable[[JsonObject], Awaitable[None] | None],
+    ) -> None:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session ID is required")
+        if not callable(sink):
+            raise ValueError("new-session sink must be callable")
+        async with self._lock:
+            if self._session_id is not None:
+                raise AcpCompatibilityError("new-session fence is already bound")
+            self._session_id = session_id
+            self._sink = sink
+            for notification in self._pending:
+                observed = self._session_update_id(notification)
+                if observed is not None and observed != session_id:
+                    raise AcpCompatibilityError(
+                        "ACP buffered new-session update has a mismatched session"
+                    )
+                await self._forward(notification)
+            self._pending.clear()
+            self._pending_bytes = 0
+
+
 def _metadata_values(result: JsonObject, field: str) -> list[tuple[str, Any]]:
     values: list[tuple[str, Any]] = []
     if field in result:
@@ -299,6 +430,39 @@ def _metadata_values(result: JsonObject, field: str) -> list[tuple[str, Any]]:
         if isinstance(detail, dict) and field in detail:
             values.append((f"result._meta.x.ai/sessionDetail.{field}", detail[field]))
     return values
+
+
+def _validate_new_result(result: Any, project: Path) -> tuple[str, JsonObject]:
+    if not isinstance(result, dict):
+        raise AcpCompatibilityError("ACP session/new returned a non-object result")
+    if "_meta" in result and not isinstance(result["_meta"], dict):
+        raise AcpCompatibilityError("ACP session/new metadata is not an object")
+    values = _metadata_values(result, "sessionId")
+    if not values:
+        raise AcpCompatibilityError("ACP session/new result omitted session identity")
+    session_id: str | None = None
+    for label, value in values:
+        if not isinstance(value, str) or not value:
+            raise AcpCompatibilityError(f"ACP session/new session identity is invalid at {label}")
+        try:
+            canonical = str(uuid.UUID(value))
+        except ValueError as exc:
+            raise AcpCompatibilityError("ACP session/new session identity is not a UUID") from exc
+        if canonical != value.lower():
+            raise AcpCompatibilityError("ACP session/new session identity is not canonical")
+        if session_id is None:
+            session_id = canonical
+        elif session_id != canonical:
+            raise AcpCompatibilityError("ACP session/new returned conflicting session identities")
+    assert session_id is not None
+    expected_project = project.expanduser().resolve()
+    for label, value in (
+        _metadata_values(result, "cwd")
+        + _metadata_values(result, "currentWorkingDirectory")
+    ):
+        if not isinstance(value, str) or Path(value).expanduser().resolve() != expected_project:
+            raise AcpCompatibilityError(f"ACP session/new cwd mismatch at {label}: {value!r}")
+    return session_id, result
 
 
 def _validate_resume_result(
@@ -421,6 +585,77 @@ async def resume_session(
         ) from exc
     await replay_fence.seal()
     return mode, validated
+
+
+async def load_session(
+    client: AsyncAcpClient,
+    handshake: AcpHandshake,
+    session_id: str,
+    project: Path,
+    *,
+    replay_fence: ResumeReplayFence,
+    expected_model_id: str | None = None,
+) -> JsonObject:
+    """Load an existing session on a fresh ACP sidecar and validate its identity."""
+
+    if handshake.capabilities.get("loadSession") is not True:
+        raise AcpCompatibilityError("Grok session/load capability is unavailable")
+    if replay_fence.session_id != session_id or replay_fence.mode != "load":
+        raise AcpCompatibilityError("load replay fence does not match the session")
+    if replay_fence.sealed:
+        raise AcpCompatibilityError("load replay fence was sealed before session/load")
+    if getattr(client, "notification_sink", None) is not replay_fence:
+        raise AcpCompatibilityError(
+            "load replay fence is not the configured ACP notification sink"
+        )
+    project = project.expanduser().resolve()
+    result = await client.call(
+        "session/load",
+        {"sessionId": session_id, "cwd": str(project), "mcpServers": []},
+        timeout=120,
+    )
+    validated = _validate_resume_result(
+        result, session_id, project, expected_model_id
+    )
+    try:
+        await client.flush_notifications()
+    except (AttributeError, ValueError) as exc:
+        raise AcpCompatibilityError(
+            "ACP transport lacks an active notification-sink barrier"
+        ) from exc
+    await replay_fence.seal()
+    return validated
+
+
+async def create_session(
+    client: AsyncAcpClient,
+    project: Path,
+    *,
+    notification_fence: NewSessionFence,
+    live_sink_factory: Callable[[str], Callable[[JsonObject], Awaitable[None] | None]],
+) -> tuple[str, JsonObject]:
+    """Create an ACP session and make its creator a validated live binding."""
+
+    if getattr(client, "notification_sink", None) is not notification_fence:
+        raise AcpCompatibilityError(
+            "new-session fence is not the configured ACP notification sink"
+        )
+    project = project.expanduser().resolve()
+    result = await client.call(
+        "session/new",
+        {"cwd": str(project), "mcpServers": []},
+        timeout=120,
+    )
+    session_id, validated = _validate_new_result(result, project)
+    live_sink = live_sink_factory(session_id)
+    await notification_fence.bind(session_id, live_sink)
+    try:
+        await client.flush_notifications()
+    except (AttributeError, ValueError) as exc:
+        raise AcpCompatibilityError(
+            "ACP transport lacks an active notification-sink barrier"
+        ) from exc
+    return session_id, validated
 
 
 PermissionDecision = Callable[[JsonObject], Awaitable[str] | str]
